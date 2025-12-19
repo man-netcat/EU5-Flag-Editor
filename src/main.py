@@ -482,6 +482,9 @@ class EmblemItem(QGraphicsPixmapItem):
         # support independent X/Y scaling
         self.scale_x = 1.0
         self.scale_y = 1.0
+        # mirroring flags
+        self.mirror_x = False
+        self.mirror_y = False
         # per-emblem color values as (r,g,b) 0-255 or None; index 0..2
         self.color_vals = [None, None, None]
         self.update_pixmap()
@@ -804,6 +807,19 @@ class MainWindow(QMainWindow):
         sy_row.addStretch()
         sy_row.addWidget(self.scale_y_spin)
         right.addLayout(sy_row)
+
+        # Mirror controls
+        mirror_row = QHBoxLayout()
+        self.mirror_x_btn = QPushButton("Mirror X")
+        self.mirror_x_btn.setCheckable(True)
+        self.mirror_y_btn = QPushButton("Mirror Y")
+        self.mirror_y_btn.setCheckable(True)
+        self.mirror_x_btn.clicked.connect(self.mirror_x_toggled)
+        self.mirror_y_btn.clicked.connect(self.mirror_y_toggled)
+        mirror_row.addWidget(self.mirror_x_btn)
+        mirror_row.addWidget(self.mirror_y_btn)
+        mirror_row.addStretch()
+        right.addLayout(mirror_row)
 
         # wire up synchronization: sliders <-> spinboxes and handlers
         self.scale_x_spin.valueChanged.connect(lambda v: self.scale_x_slider.setValue(v))
@@ -1491,6 +1507,22 @@ class MainWindow(QMainWindow):
         item.set_scale_y(sy)
         self.update_emblem_pixmap(item)
 
+    def mirror_x_toggled(self, checked):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            return
+        for item in sel:
+            item.mirror_x = bool(checked)
+            self.update_emblem_pixmap(item)
+
+    def mirror_y_toggled(self, checked):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            return
+        for item in sel:
+            item.mirror_y = bool(checked)
+            self.update_emblem_pixmap(item)
+
     def export_coa(self):
         # collect current pattern filename (if any)
         # use selected pattern if present, otherwise prompt
@@ -1671,6 +1703,15 @@ class MainWindow(QMainWindow):
                 self.scale_y_slider.blockSignals(False)
             except Exception:
                 pass
+        # update mirror button states for selected emblem
+        try:
+            if getattr(item, "texture_type", "colored") != "colored":
+                # textured emblems can still be mirrored visually
+                pass
+            self.mirror_x_btn.setChecked(bool(getattr(item, "mirror_x", False)))
+            self.mirror_y_btn.setChecked(bool(getattr(item, "mirror_y", False)))
+        except Exception:
+            pass
         # textured emblems have no colors: hide controls and disable swatches
         if getattr(item, "texture_type", "colored") != "colored":
             self.update_emblem_color_controls(0)
@@ -1769,6 +1810,15 @@ class MainWindow(QMainWindow):
             if newh <= 0:
                 newh = 1
             pil = pil.resize((neww, newh), Image.Resampling.LANCZOS)
+
+        # apply mirroring flags if set
+        try:
+            if getattr(item, "mirror_x", False):
+                pil = ImageOps.mirror(pil)
+            if getattr(item, "mirror_y", False):
+                pil = ImageOps.flip(pil)
+        except Exception:
+            pass
 
         # NOTE: emblem masking by pattern disabled — emblems are drawn above the pattern
 
