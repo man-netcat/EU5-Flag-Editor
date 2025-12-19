@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QGraphicsItem,
     QAbstractItemView,
+    QSpinBox,
 )
 from PySide6.QtGui import QPixmap, QImage, Qt, QDrag, QPainter, QColor
 from PySide6.QtCore import QByteArray, QMimeData, QPointF, QSize
@@ -42,6 +43,11 @@ import math
 
 
 class DraggableListWidget(QListWidget):
+    def __init__(self, asset_type: str = "colored_emblems", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # asset_type is the key in MainWindow.assets this list represents
+        self.asset_type = asset_type
+
     def startDrag(self, supportedActions):
         item = self.currentItem()
         if not item:
@@ -50,25 +56,36 @@ class DraggableListWidget(QListWidget):
         # parent MainWindow stores assets dict; walk up to find it
         mw = self.window()
         path = None
-        if hasattr(mw, "assets") and "colored_emblems" in mw.assets:
-            path = mw.assets["colored_emblems"].get(name)
+        if hasattr(mw, "assets") and self.asset_type in mw.assets:
+            path = mw.assets[self.asset_type].get(name)
         if not path:
             return
         # debug: starting drag suppressed
         drag = QDrag(self)
         md = QMimeData()
         payload = json.dumps({"path": str(path), "type": "colored"})
-        md.setData("application/x-eu5-asset", QByteArray(payload.encode("utf-8")))
+        # set type according to asset_type
+        p = json.loads(payload)
+        if self.asset_type == "textured_emblems":
+            p["type"] = "textured"
+        else:
+            p["type"] = "colored"
+        md.setData("application/x-eu5-asset", QByteArray(json.dumps(p).encode("utf-8")))
         drag.setMimeData(md)
         img = load_image(path)
         drag.setPixmap(pil2pixmap(img.resize((64, 64))))
         drag.exec(Qt.CopyAction)
 
     def mousePressEvent(self, event):
-        item = self.itemAt(event.pos())
-        if item:
-            self.setCurrentItem(item)
+        # Let the base class process the event first (selection/drag logic)
         super().mousePressEvent(event)
+        try:
+            item = self.itemAt(event.pos())
+            # only update current item if it's different to avoid unnecessary scrolling
+            if item and item is not self.currentItem():
+                self.setCurrentItem(item)
+        except Exception:
+            pass
 
 
 class DropGraphicsView(QGraphicsView):
@@ -123,6 +140,46 @@ class DropGraphicsView(QGraphicsView):
                 event.acceptProposedAction()
         except Exception:
             event.ignore()
+
+    def keyPressEvent(self, event):
+        """Handle arrow keys to nudge selected emblems.
+
+        Arrow keys move by 1px; Shift+arrow moves by 5px.
+        """
+        key = event.key()
+        step = 1
+        try:
+            if event.modifiers() & Qt.ShiftModifier:
+                step = 5
+        except Exception:
+            pass
+
+        dx = dy = 0
+        if key == Qt.Key_Left:
+            dx = -step
+        elif key == Qt.Key_Right:
+            dx = step
+        elif key == Qt.Key_Up:
+            dy = -step
+        elif key == Qt.Key_Down:
+            dy = step
+        else:
+            return super().keyPressEvent(event)
+
+        moved = False
+        try:
+            for it in self.scene().selectedItems():
+                # EmblemItem may not be defined yet at import time; detect by attribute
+                if hasattr(it, "image_path"):
+                    it.setPos(it.pos() + QPointF(dx, dy))
+                    moved = True
+        except Exception:
+            moved = False
+
+        if moved:
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -422,7 +479,9 @@ class EmblemItem(QGraphicsPixmapItem):
         self.image_path = Path(image_path)
         self.base_image = pil_image  # original PIL image
         self.texture_type = texture_type
-        self.scale_factor = 1.0
+        # support independent X/Y scaling
+        self.scale_x = 1.0
+        self.scale_y = 1.0
         # per-emblem color values as (r,g,b) 0-255 or None; index 0..2
         self.color_vals = [None, None, None]
         self.update_pixmap()
@@ -434,11 +493,11 @@ class EmblemItem(QGraphicsPixmapItem):
         if self.texture_type == "colored" and any(c is not None for c in cvs):
             img = recolor_colored_emblem(self.base_image, cvs)
         pix = pil2pixmap(img)
-        if self.scale_factor != 1.0:
+        if self.scale_x != 1.0 or self.scale_y != 1.0:
             pix = pix.scaled(
-                int(pix.width() * self.scale_factor),
-                int(pix.height() * self.scale_factor),
-                Qt.KeepAspectRatio,
+                int(pix.width() * self.scale_x),
+                int(pix.height() * self.scale_y),
+                Qt.IgnoreAspectRatio,
                 Qt.SmoothTransformation,
             )
         self.setPixmap(pix)
@@ -455,8 +514,48 @@ class EmblemItem(QGraphicsPixmapItem):
         return
 
     def set_scale_factor(self, s: float):
-        self.scale_factor = s
+        # uniform setter: apply to both axes
+        if s is None:
+            return
+        try:
+            s = float(s)
+        except Exception:
+            return
+        if s < 0.1:
+            s = 0.1
+        if s > 1.0:
+            s = 1.0
+        self.scale_x = s
+        self.scale_y = s
         # pixmap update is performed by the MainWindow to allow pattern masking
+        return
+
+    def set_scale_x(self, s: float):
+        if s is None:
+            return
+        try:
+            s = float(s)
+        except Exception:
+            return
+        if s < 0.1:
+            s = 0.1
+        if s > 1.0:
+            s = 1.0
+        self.scale_x = s
+        return
+
+    def set_scale_y(self, s: float):
+        if s is None:
+            return
+        try:
+            s = float(s)
+        except Exception:
+            return
+        if s < 0.1:
+            s = 0.1
+        if s > 1.0:
+            s = 1.0
+        self.scale_y = s
         return
 
 
@@ -578,7 +677,7 @@ class MainWindow(QMainWindow):
         self.patterns_search = QLineEdit()
         self.patterns_search.setPlaceholderText("Search patterns...")
         self.patterns_search.textChanged.connect(self.filter_patterns)
-        self.emblems_list = DraggableListWidget()
+        self.emblems_list = DraggableListWidget(asset_type="colored_emblems")
         self.emblems_list.setDragEnabled(True)
         left.addWidget(QLabel("Patterns (patterns)"))
         left.addWidget(self.patterns_list)
@@ -589,7 +688,18 @@ class MainWindow(QMainWindow):
         self.emblems_search.setPlaceholderText("Search emblems...")
         self.emblems_search.textChanged.connect(self.filter_emblems)
         left.addWidget(self.emblems_list)
+        # textured emblems list (hidden by default)
+        self.textured_emblems_list = DraggableListWidget(asset_type="textured_emblems")
+        self.textured_emblems_list.setDragEnabled(True)
+        self.textured_emblems_list.setVisible(False)
+        left.addWidget(self.textured_emblems_list)
         left.addWidget(self.emblems_search)
+
+        # toggle button to switch between colored and textured emblem views
+        self.toggle_emblem_btn = QPushButton("Show Textured Emblems")
+        self.toggle_emblem_btn.setCheckable(True)
+        self.toggle_emblem_btn.clicked.connect(self.toggle_emblem_list)
+        left.addWidget(self.toggle_emblem_btn)
 
         settings_btn = QPushButton("Settings")
         settings_btn.clicked.connect(self.open_settings)
@@ -642,12 +752,64 @@ class MainWindow(QMainWindow):
         # Apply button removed; emblem pickers update immediately
 
         scale_label = QLabel("Scale (selected)")
-        self.scale_slider = QSlider(Qt.Horizontal)
-        self.scale_slider.setRange(10, 300)
-        self.scale_slider.setValue(100)
-        self.scale_slider.valueChanged.connect(self.scale_changed)
-        right.addWidget(scale_label)
-        right.addWidget(self.scale_slider)
+        # separate X and Y scale controls (percent)
+        # Scale X
+        sx_label = QLabel("Scale X (selected)")
+        self.scale_x_slider = QSlider(Qt.Horizontal)
+        self.scale_x_slider.setRange(10, 100)
+        self.scale_x_slider.setValue(100)
+        right.addWidget(sx_label)
+        right.addWidget(self.scale_x_slider)
+        sx_row = QHBoxLayout()
+        sx_btn25 = QPushButton("25%")
+        sx_btn50 = QPushButton("50%")
+        sx_btn100 = QPushButton("100%")
+        self.scale_x_spin = QSpinBox()
+        self.scale_x_spin.setRange(10, 100)
+        self.scale_x_spin.setValue(100)
+        self.scale_x_spin.setSuffix("%")
+        self.scale_x_spin.setFixedWidth(80)
+        sx_btn25.clicked.connect(lambda: self.scale_x_spin.setValue(25))
+        sx_btn50.clicked.connect(lambda: self.scale_x_spin.setValue(50))
+        sx_btn100.clicked.connect(lambda: self.scale_x_spin.setValue(100))
+        sx_row.addWidget(sx_btn25)
+        sx_row.addWidget(sx_btn50)
+        sx_row.addWidget(sx_btn100)
+        sx_row.addStretch()
+        sx_row.addWidget(self.scale_x_spin)
+        right.addLayout(sx_row)
+
+        # Scale Y
+        sy_label = QLabel("Scale Y (selected)")
+        self.scale_y_slider = QSlider(Qt.Horizontal)
+        self.scale_y_slider.setRange(10, 100)
+        self.scale_y_slider.setValue(100)
+        right.addWidget(sy_label)
+        right.addWidget(self.scale_y_slider)
+        sy_row = QHBoxLayout()
+        sy_btn25 = QPushButton("25%")
+        sy_btn50 = QPushButton("50%")
+        sy_btn100 = QPushButton("100%")
+        self.scale_y_spin = QSpinBox()
+        self.scale_y_spin.setRange(10, 100)
+        self.scale_y_spin.setValue(100)
+        self.scale_y_spin.setSuffix("%")
+        self.scale_y_spin.setFixedWidth(80)
+        sy_btn25.clicked.connect(lambda: self.scale_y_spin.setValue(25))
+        sy_btn50.clicked.connect(lambda: self.scale_y_spin.setValue(50))
+        sy_btn100.clicked.connect(lambda: self.scale_y_spin.setValue(100))
+        sy_row.addWidget(sy_btn25)
+        sy_row.addWidget(sy_btn50)
+        sy_row.addWidget(sy_btn100)
+        sy_row.addStretch()
+        sy_row.addWidget(self.scale_y_spin)
+        right.addLayout(sy_row)
+
+        # wire up synchronization: sliders <-> spinboxes and handlers
+        self.scale_x_spin.valueChanged.connect(lambda v: self.scale_x_slider.setValue(v))
+        self.scale_x_slider.valueChanged.connect(lambda v: (self.scale_x_spin.blockSignals(True), self.scale_x_spin.setValue(v), self.scale_x_spin.blockSignals(False), self.scale_x_changed(v)))
+        self.scale_y_spin.valueChanged.connect(lambda v: self.scale_y_slider.setValue(v))
+        self.scale_y_slider.valueChanged.connect(lambda v: (self.scale_y_spin.blockSignals(True), self.scale_y_spin.setValue(v), self.scale_y_spin.blockSignals(False), self.scale_y_changed(v)))
 
         # center controls: center both axes or individually
         ctr_row = QHBoxLayout()
@@ -681,10 +843,13 @@ class MainWindow(QMainWindow):
         # respond to selection changes in the scene so controls reflect selected emblem
         self.scene.selectionChanged.connect(self.on_selection_changed)
         # double-click or context action to add emblem to scene as a fallback
+        # colored list double-click
         self.emblems_list.itemDoubleClicked.connect(
-            lambda it: self.add_emblem_to_scene(
-                Path(self.assets["colored_emblems"].get(it.text())), "colored"
-            )
+            partial(self._double_click_add_from_list, self.emblems_list)
+        )
+        # textured list double-click
+        self.textured_emblems_list.itemDoubleClicked.connect(
+            partial(self._double_click_add_from_list, self.textured_emblems_list)
         )
 
         # show loaded pattern as background when selected
@@ -739,7 +904,9 @@ class MainWindow(QMainWindow):
         self.assets["colored_emblems"] = gather(
             Path("game") / "main_menu" / "gfx" / "coat_of_arms" / "colored_emblems"
         )
-        # textured omitted for now
+        self.assets["textured_emblems"] = gather(
+            Path("game") / "main_menu" / "gfx" / "coat_of_arms" / "textured_emblems"
+        )
         self.populate_lists()
         # load named colors file if available
         named_colors_path = None
@@ -754,13 +921,8 @@ class MainWindow(QMainWindow):
             )
             if p.exists():
                 named_colors_path = p
-        # as a fallback, try to find in workspace path used by user (attachment may be in that path)
-        if not named_colors_path:
-            alt = Path(
-                "/home/rick/Paradox/Games/Europa Universalis V/game/main_menu/common/named_colors/01_coa.txt"
-            )
-            if alt.exists():
-                named_colors_path = alt
+        # do not use hardcoded paths; only use provided base/mod folders
+        # if named colors not found in base, leave as empty and proceed
         self.named_colors = {}
         if named_colors_path:
             try:
@@ -848,6 +1010,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Color", "Select an emblem first")
             return
         item = sel[0]
+        if getattr(item, "texture_type", "colored") != "colored":
+            QMessageBox.information(self, "Color", "Textured emblems have no colors")
+            return
         # initial color: emblem color1 if present, else emblem fallback to global color1
         init = getattr(self.em_col1_btn, "_qcolor", None)
         if init is None:
@@ -877,6 +1042,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Color", "Select an emblem first")
             return
         item = sel[0]
+        if getattr(item, "texture_type", "colored") != "colored":
+            QMessageBox.information(self, "Color", "Textured emblems have no colors")
+            return
         init = getattr(self.em_col2_btn, "_qcolor", None)
         if init is None:
             cv = item.color_vals[1]
@@ -903,6 +1071,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Color", "Select an emblem first")
             return
         item = sel[0]
+        if getattr(item, "texture_type", "colored") != "colored":
+            QMessageBox.information(self, "Color", "Textured emblems have no colors")
+            return
         init = getattr(self.em_col3_btn, "_qcolor", None)
         if init is None:
             cv = item.color_vals[2]
@@ -939,6 +1110,14 @@ class MainWindow(QMainWindow):
             thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
             item.setIcon(thumb)
             self.emblems_list.addItem(item)
+        # textured emblems
+        self.textured_emblems_list.clear()
+        for name, path in sorted(self.assets.get("textured_emblems", {}).items()):
+            item = QListWidgetItem(name)
+            img = load_image(path)
+            thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
+            item.setIcon(thumb)
+            self.textured_emblems_list.addItem(item)
         # clear any search filters
         try:
             self.patterns_search.setText("")
@@ -959,11 +1138,12 @@ class MainWindow(QMainWindow):
 
     def filter_emblems(self, text: str):
         t = (text or "").lower()
-        for i in range(self.emblems_list.count()):
-            it = self.emblems_list.item(i)
-            if not it:
-                continue
-            it.setHidden(t not in it.text().lower())
+        for lst in (self.emblems_list, self.textured_emblems_list):
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if not it:
+                    continue
+                it.setHidden(t not in it.text().lower())
 
     def open_settings(self):
         # open persistent settings window
@@ -978,6 +1158,27 @@ class MainWindow(QMainWindow):
             pass
         self.settings_window = SettingsWindow(self)
         self.settings_window.show()
+
+    def _double_click_add_from_list(self, lst: DraggableListWidget, item: QListWidgetItem):
+        # Helper for double-click: add emblem from specified list
+        name = item.text()
+        path = self.assets.get(lst.asset_type, {}).get(name)
+        if not path:
+            return
+        typ = "textured" if lst.asset_type == "textured_emblems" else "colored"
+        self.add_emblem_to_scene(Path(path), typ)
+
+    def toggle_emblem_list(self):
+        # toggle between colored and textured emblem lists
+        show_textured = self.toggle_emblem_btn.isChecked()
+        if show_textured:
+            self.emblems_list.setVisible(False)
+            self.textured_emblems_list.setVisible(True)
+            self.toggle_emblem_btn.setText("Show Colored Emblems")
+        else:
+            self.emblems_list.setVisible(True)
+            self.textured_emblems_list.setVisible(False)
+            self.toggle_emblem_btn.setText("Show Textured Emblems")
 
     def select_pattern(self, item: QListWidgetItem):
         name = item.text()
@@ -1143,6 +1344,16 @@ class MainWindow(QMainWindow):
 
     def update_emblem_color_controls(self, slots: int):
         # slots: number of emblem colour slots (1..3). Show/hide accordingly.
+        # allow slots==0 to hide all emblem colour controls for textured emblems
+        if slots <= 0:
+            # hide all emblem controls
+            self.em_col1_label.setVisible(False)
+            self.em_col1_btn.setVisible(False)
+            self.em_col2_label.setVisible(False)
+            self.em_col2_btn.setVisible(False)
+            self.em_col3_label.setVisible(False)
+            self.em_col3_btn.setVisible(False)
+            return
         if slots < 1:
             slots = 1
         if slots > 3:
@@ -1170,24 +1381,25 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         it = EmblemItem(path, pil, texture_type=typ)
-        # if there are saved colors for this texture, apply them to the item
-        try:
-            saved = self.emblem_saved_colors.get(it.image_path.name)
-            if saved:
-                # ensure list length 3
-                it.color_vals = list(saved[:3]) + [None] * (3 - len(saved))
-        except Exception:
-            pass
-        else:
-            # no saved colors: infer which mask slots are actually present in the emblem
+        # textured emblems do not have colors: leave color_vals as all None
+        if it.texture_type == "colored":
+            # if there are saved colors for this texture, apply them to the item
             try:
-                inferred = infer_emblem_mask_colors(it.base_image)
-                new_vals = [None, None, None]
-                if inferred:
-                    for idx in range(min(3, len(inferred))):
-                        if inferred[idx]:
-                            new_vals[idx] = (inferred[idx][0], inferred[idx][1], inferred[idx][2])
-                it.color_vals = new_vals
+                saved = self.emblem_saved_colors.get(it.image_path.name)
+                if saved:
+                    # ensure list length 3
+                    it.color_vals = list(saved[:3]) + [None] * (3 - len(saved))
+                else:
+                    # no saved colors: infer which mask slots are actually present in the emblem
+                    inferred = infer_emblem_mask_colors(it.base_image)
+                    new_vals = [None, None, None]
+                    if inferred:
+                        for idx in range(min(3, len(inferred))):
+                            if inferred[idx]:
+                                new_vals[idx] = (
+                                    inferred[idx][0], inferred[idx][1], inferred[idx][2]
+                                )
+                    it.color_vals = new_vals
             except Exception:
                 # fallback: leave color_vals as None
                 pass
@@ -1252,12 +1464,31 @@ class MainWindow(QMainWindow):
         return
 
     def scale_changed(self, val):
+        # kept for backward compatibility: set both axes
         sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
         if not sel:
             return
         item = sel[0]
         s = val / 100.0
         item.set_scale_factor(s)
+        self.update_emblem_pixmap(item)
+
+    def scale_x_changed(self, val):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            return
+        item = sel[0]
+        sx = val / 100.0
+        item.set_scale_x(sx)
+        self.update_emblem_pixmap(item)
+
+    def scale_y_changed(self, val):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            return
+        item = sel[0]
+        sy = val / 100.0
+        item.set_scale_y(sy)
         self.update_emblem_pixmap(item)
 
     def export_coa(self):
@@ -1334,61 +1565,67 @@ class MainWindow(QMainWindow):
         emblems.sort(key=lambda e: e.zValue())
         for e in emblems:
             tex = e.image_path.name
-            lines.append("    colored_emblem = {")
-            lines.append(f'        texture = "{tex}"')
-            # emblem colors: export explicit rgb by default; if an emblem color equals the
-            # corresponding pattern color exactly, reference the pattern color name instead
-            ev = e.color_vals
-            try:
-                inferred_emblem = infer_emblem_mask_colors(e.base_image)
-            except Exception:
-                inferred_emblem = [None, None, None]
+            if getattr(e, "texture_type", "colored") == "colored":
+                lines.append("    colored_emblem = {")
+                lines.append(f'        texture = "{tex}"')
+                # emblem colors: export explicit rgb by default
+                ev = e.color_vals
+                try:
+                    inferred_emblem = infer_emblem_mask_colors(e.base_image)
+                except Exception:
+                    inferred_emblem = [None, None, None]
 
-            saved = getattr(self, 'emblem_saved_colors', {}).get(tex)
-            # prefer explicit per-item colors to determine how many slots this emblem uses
-            explicit_count = len([c for c in ev if c])
-            if explicit_count > 0:
-                emblem_slots = explicit_count
-            else:
-                # fall back to saved per-texture
-                saved_count = len([c for c in saved if c]) if saved else 0
-                if saved_count > 0:
-                    emblem_slots = saved_count
+                saved = getattr(self, "emblem_saved_colors", {}).get(tex)
+                # prefer explicit per-item colors to determine how many slots this emblem uses
+                explicit_count = len([c for c in ev if c])
+                if explicit_count > 0:
+                    emblem_slots = explicit_count
                 else:
-                    # fall back to inferred emblem mask colors
-                    inferred_count = len([c for c in inferred_emblem if c]) if inferred_emblem else 0
-                    emblem_slots = inferred_count if inferred_count > 0 else 1
+                    # fall back to saved per-texture
+                    saved_count = len([c for c in saved if c]) if saved else 0
+                    if saved_count > 0:
+                        emblem_slots = saved_count
+                    else:
+                        # fall back to inferred emblem mask colors
+                        inferred_count = (
+                            len([c for c in inferred_emblem if c])
+                            if inferred_emblem
+                            else 0
+                        )
+                        emblem_slots = inferred_count if inferred_count > 0 else 1
 
-            # export emblem colours for this emblem instance according to emblem_slots
-            for idx in range(emblem_slots):
-                pname = ("color1", "color2", "color3")[idx]
-                pat_rgb = [pattern_c1, pattern_c2, pattern_c3][idx]
-                # priority: explicit item color -> saved per-texture -> inferred emblem mask -> pattern color
-                rgb_to_use = None
-                if idx < len(ev) and ev[idx]:
-                    rgb_to_use = ev[idx]
-                elif saved and idx < len(saved) and saved[idx]:
-                    rgb_to_use = saved[idx]
-                elif inferred_emblem and idx < len(inferred_emblem) and inferred_emblem[idx]:
-                    rgb_to_use = inferred_emblem[idx]
-                # do NOT fall back to pattern color here; emblem export should use emblem's own colours only
+                # export emblem colours for this emblem instance according to emblem_slots
+                for idx in range(emblem_slots):
+                    pname = ("color1", "color2", "color3")[idx]
+                    # priority: explicit item color -> saved per-texture -> inferred emblem mask
+                    rgb_to_use = None
+                    if idx < len(ev) and ev[idx]:
+                        rgb_to_use = ev[idx]
+                    elif saved and idx < len(saved) and saved[idx]:
+                        rgb_to_use = saved[idx]
+                    elif inferred_emblem and idx < len(inferred_emblem) and inferred_emblem[idx]:
+                        rgb_to_use = inferred_emblem[idx]
 
-                if not rgb_to_use:
-                    continue
-                r = int(rgb_to_use[0])
-                g = int(rgb_to_use[1])
-                b = int(rgb_to_use[2])
-                lines.append(f"        {pname} = rgb {{ {r} {g} {b} }}")
+                    if not rgb_to_use:
+                        continue
+                    r = int(rgb_to_use[0])
+                    g = int(rgb_to_use[1])
+                    b = int(rgb_to_use[2])
+                    lines.append(f"        {pname} = rgb {{ {r} {g} {b} }}")
+            else:
+                # textured emblem: add textured_emblem block without color overrides
+                lines.append("    textured_emblem = {")
+                lines.append(f'        texture = "{tex}"')
             # instance
             pos = e.pos()
             # position is relative to top-left; convert to normalized center
-            # QGraphicsPixmapItem pos is top-left by default; compute center
             w = e.pixmap().width()
             h = e.pixmap().height()
             center_x = (pos.x() + w / 2) / CANVAS_W
             center_y = (pos.y() + h / 2) / CANVAS_H
-            scale_x = e.scale_factor
-            scale_y = e.scale_factor
+            # use per-axis scales when exporting
+            scale_x = getattr(e, "scale_x", getattr(e, "scale_factor", 1.0))
+            scale_y = getattr(e, "scale_y", getattr(e, "scale_factor", 1.0))
             lines.append("        instance = {")
             lines.append(f"            position = {{ {center_x:.3f} {center_y:.3f} }}")
             lines.append(f"            scale = {{ {scale_x:.3f} {scale_y:.3f} }}")
@@ -1414,13 +1651,33 @@ class MainWindow(QMainWindow):
             return
         item = sel[0]
         # update scale slider to match item
+        # sync X/Y scale controls with selected item
         try:
-            self.scale_slider.blockSignals(True)
-            self.scale_slider.setValue(int(item.scale_factor * 100))
+            self.scale_x_spin.blockSignals(True)
+            self.scale_y_spin.blockSignals(True)
+            self.scale_x_slider.blockSignals(True)
+            self.scale_y_slider.blockSignals(True)
+            sx = int(getattr(item, "scale_x", getattr(item, "scale_factor", 1.0)) * 100)
+            sy = int(getattr(item, "scale_y", getattr(item, "scale_factor", 1.0)) * 100)
+            self.scale_x_spin.setValue(sx)
+            self.scale_x_slider.setValue(sx)
+            self.scale_y_spin.setValue(sy)
+            self.scale_y_slider.setValue(sy)
         finally:
-            self.scale_slider.blockSignals(False)
-        # update emblem color pickers to reflect selected emblem
-        # determine how many emblem slots this emblem actually uses
+            try:
+                self.scale_x_spin.blockSignals(False)
+                self.scale_y_spin.blockSignals(False)
+                self.scale_x_slider.blockSignals(False)
+                self.scale_y_slider.blockSignals(False)
+            except Exception:
+                pass
+        # textured emblems have no colors: hide controls and disable swatches
+        if getattr(item, "texture_type", "colored") != "colored":
+            self.update_emblem_color_controls(0)
+            for b in (self.em_col1_btn, self.em_col2_btn, self.em_col3_btn):
+                b.setEnabled(False)
+            return
+
         try:
             inferred_slots = infer_emblem_mask_colors(item.base_image)
             num_slots = len([s for s in inferred_slots if s])
@@ -1501,10 +1758,12 @@ class MainWindow(QMainWindow):
             c is not None for c in item.color_vals
         ):
             pil = recolor_colored_emblem(item.base_image, item.color_vals)
-        # scale emblem according to item.scale_factor
-        if item.scale_factor != 1.0:
-            neww = int(pil.width * item.scale_factor)
-            newh = int(pil.height * item.scale_factor)
+        # scale emblem according to per-axis scales
+        sx = getattr(item, "scale_x", getattr(item, "scale_factor", 1.0))
+        sy = getattr(item, "scale_y", getattr(item, "scale_factor", 1.0))
+        if sx != 1.0 or sy != 1.0:
+            neww = int(pil.width * sx)
+            newh = int(pil.height * sy)
             if neww <= 0:
                 neww = 1
             if newh <= 0:
