@@ -766,6 +766,11 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.open_settings)
         left.addWidget(settings_btn)
 
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setToolTip("Re-scan base/mod folders and refresh available files")
+        refresh_btn.clicked.connect(self.scan_assets)
+        left.addWidget(refresh_btn)
+
         h.addLayout(left, 1)
 
         # Center canvas
@@ -1174,73 +1179,90 @@ class MainWindow(QMainWindow):
             self.update_emblem_pixmap(item)
 
     def populate_lists(self):
-        # Build a flattened list of assets to generate thumbnails for, then show progress
+        # Populate lists. Only generate thumbnails for assets that don't already
+        # have a cached thumbnail (so Refresh only adds new ones).
         patterns = sorted(self.assets.get("patterns", {}).items())
         colored = sorted(self.assets.get("colored_emblems", {}).items())
         textured = sorted(self.assets.get("textured_emblems", {}).items())
 
-        total = len(patterns) + len(colored) + len(textured)
-        progress = None
-        if total > 8:
-            progress = QProgressDialog("Generating thumbnails...", "Cancel", 0, total, self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(200)
-            progress.setAutoClose(True)
-            progress.setValue(0)
+        pending = []  # list of (list_widget, QListWidgetItem, path, size)
 
-        # patterns
+        # patterns (96px width)
         self.patterns_list.clear()
-        i = 0
         for name, path in patterns:
-            if progress and progress.wasCanceled():
-                break
             item = QListWidgetItem(name)
-            try:
-                pix = get_cached_pixmap(Path(path), (96, 96))
-            except Exception:
-                img = load_image(path)
-                pix = pil2pixmap(img.resize((96, int(96 * img.height / img.width))))
-            item.setIcon(pix)
+            cache_path = _thumb_cache_key(Path(path), (96, 96))
+            if cache_path.exists():
+                try:
+                    pix = get_cached_pixmap(Path(path), (96, 96))
+                    item.setIcon(pix)
+                except Exception:
+                    img = load_image(path)
+                    item.setIcon(pil2pixmap(img.resize((96, int(96 * img.height / img.width)))))
+            else:
+                # placeholder now; will generate below
+                item.setIcon(QPixmap(96, 96))
+                pending.append((self.patterns_list, item, Path(path), (96, 96)))
             self.patterns_list.addItem(item)
-            i += 1
-            if progress:
-                progress.setValue(i)
-                QApplication.processEvents()
 
-        # colored emblems
+        # colored emblems (64px)
         self.emblems_list.clear()
         for name, path in colored:
-            if progress and progress.wasCanceled():
-                break
             item = QListWidgetItem(name)
-            try:
-                pix = get_cached_pixmap(Path(path), (64, 64))
-            except Exception:
-                img = load_image(path)
-                pix = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(pix)
+            cache_path = _thumb_cache_key(Path(path), (64, 64))
+            if cache_path.exists():
+                try:
+                    pix = get_cached_pixmap(Path(path), (64, 64))
+                    item.setIcon(pix)
+                except Exception:
+                    img = load_image(path)
+                    item.setIcon(pil2pixmap(img.resize((64, int(64 * img.height / img.width)))))
+            else:
+                item.setIcon(QPixmap(64, 64))
+                pending.append((self.emblems_list, item, Path(path), (64, 64)))
             self.emblems_list.addItem(item)
-            i += 1
-            if progress:
-                progress.setValue(i)
-                QApplication.processEvents()
 
-        # textured emblems
+        # textured emblems (64px)
         self.textured_emblems_list.clear()
         for name, path in textured:
-            if progress and progress.wasCanceled():
-                break
             item = QListWidgetItem(name)
-            try:
-                pix = get_cached_pixmap(Path(path), (64, 64))
-            except Exception:
-                img = load_image(path)
-                pix = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(pix)
+            cache_path = _thumb_cache_key(Path(path), (64, 64))
+            if cache_path.exists():
+                try:
+                    pix = get_cached_pixmap(Path(path), (64, 64))
+                    item.setIcon(pix)
+                except Exception:
+                    img = load_image(path)
+                    item.setIcon(pil2pixmap(img.resize((64, int(64 * img.height / img.width)))))
+            else:
+                item.setIcon(QPixmap(64, 64))
+                pending.append((self.textured_emblems_list, item, Path(path), (64, 64)))
             self.textured_emblems_list.addItem(item)
-            i += 1
-            if progress:
-                progress.setValue(i)
+
+        # Generate thumbnails only for pending (new) assets and show progress
+        if pending:
+            prog = QProgressDialog("Generating new thumbnails...", "Cancel", 0, len(pending), self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setMinimumDuration(200)
+            prog.setAutoClose(True)
+            prog.setValue(0)
+            cnt = 0
+            for (lst, item, path, size) in pending:
+                if prog.wasCanceled():
+                    break
+                try:
+                    pix = get_cached_pixmap(path, size)
+                    item.setIcon(pix)
+                except Exception:
+                    try:
+                        img = load_image(path)
+                        w = size[0]
+                        h = int(w * img.height / img.width) if img.width else size[1]
+                        item.setIcon(pil2pixmap(img.resize((w, max(1, h)))))
+                    except Exception:
+                        pass
+                cnt += 1
+                prog.setValue(cnt)
                 QApplication.processEvents()
         # clear any search filters
         try:
