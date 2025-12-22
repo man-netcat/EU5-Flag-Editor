@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QInputDialog,
     QColorDialog,
+    QProgressDialog,
     QGraphicsItem,
     QAbstractItemView,
     QSpinBox,
@@ -40,6 +41,7 @@ from PIL import Image, ImageOps
 import re
 import colorsys
 import math
+import hashlib
 
 
 class DraggableListWidget(QListWidget):
@@ -72,8 +74,13 @@ class DraggableListWidget(QListWidget):
             p["type"] = "colored"
         md.setData("application/x-eu5-asset", QByteArray(json.dumps(p).encode("utf-8")))
         drag.setMimeData(md)
-        img = load_image(path)
-        drag.setPixmap(pil2pixmap(img.resize((64, 64))))
+        # use cached thumbnail for drag pixmap (64x64)
+        try:
+            pix = get_cached_pixmap(Path(path), (64, 64))
+        except Exception:
+            img = load_image(path)
+            pix = pil2pixmap(img.resize((64, 64)))
+        drag.setPixmap(pix)
         drag.exec(Qt.CopyAction)
 
     def mousePressEvent(self, event):
@@ -187,6 +194,10 @@ DEFAULT_BASE = ""  # leave empty; user picks
 SETTINGS_FILE = APP_DIR / "settings.json"
 CANVAS_W, CANVAS_H = 384, 256
 
+# Thumbnail cache directory (user cache under home)
+THUMB_CACHE_DIR = Path.home() / ".cache" / "eu5-flag-editor" / "thumbs"
+THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Helper: load image via PIL (works with pillow-dds plugin if installed)
 
 
@@ -205,6 +216,53 @@ def pil2pixmap(img: Image.Image):
     data = img.tobytes("raw", "RGBA")
     qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
+
+
+def _thumb_cache_key(path: Path, size: tuple[int, int]):
+    """Return a cache filename derived from path, mtime and target size."""
+    try:
+        mtime = int(path.stat().st_mtime)
+    except Exception:
+        mtime = 0
+    key = f"{str(path.resolve())}|{mtime}|{size[0]}x{size[1]}"
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return THUMB_CACHE_DIR / f"{h}.png"
+
+
+def get_cached_pixmap(path: Path, max_size: tuple[int, int]):
+    """Return QPixmap from cache or generate thumbnail and cache it."""
+    cache_path = _thumb_cache_key(path, max_size)
+    if cache_path.exists():
+        try:
+            img = Image.open(cache_path).convert("RGBA")
+            return pil2pixmap(img)
+        except Exception:
+            try:
+                cache_path.unlink()
+            except Exception:
+                pass
+    # generate and save
+    try:
+        img = Image.open(path)
+        img = img.convert("RGBA")
+        # preserve aspect ratio
+        w, h = img.width, img.height
+        tw, th = max_size
+        nw = tw
+        nh = int(tw * h / w) if w else th
+        if nh > th:
+            nh = th
+            nw = int(th * w / h) if h else tw
+        thumb = img.resize((max(1, nw), max(1, nh)), Image.LANCZOS)
+        try:
+            thumb.save(cache_path, format="PNG")
+        except Exception:
+            pass
+        return pil2pixmap(thumb)
+    except Exception:
+        # fallback placeholder
+        img = Image.new("RGBA", (max_size[0], max_size[1]), (200, 50, 50, 255))
+        return pil2pixmap(img)
 
 
 # Simple replacement of mask colors in colored emblems
@@ -852,6 +910,11 @@ class MainWindow(QMainWindow):
         export_btn.clicked.connect(self.export_coa)
         right.addWidget(export_btn)
 
+        reset_btn = QPushButton("Reset Canvas")
+        reset_btn.setToolTip("Remove all emblems and reset pattern/colors to defaults")
+        reset_btn.clicked.connect(self.reset_canvas)
+        right.addWidget(reset_btn)
+
         h.addLayout(right, 1)
 
         # connect list interactions
@@ -1111,29 +1174,74 @@ class MainWindow(QMainWindow):
             self.update_emblem_pixmap(item)
 
     def populate_lists(self):
+        # Build a flattened list of assets to generate thumbnails for, then show progress
+        patterns = sorted(self.assets.get("patterns", {}).items())
+        colored = sorted(self.assets.get("colored_emblems", {}).items())
+        textured = sorted(self.assets.get("textured_emblems", {}).items())
+
+        total = len(patterns) + len(colored) + len(textured)
+        progress = None
+        if total > 8:
+            progress = QProgressDialog("Generating thumbnails...", "Cancel", 0, total, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(200)
+            progress.setAutoClose(True)
+            progress.setValue(0)
+
+        # patterns
         self.patterns_list.clear()
-        for name, path in sorted(self.assets["patterns"].items()):
+        i = 0
+        for name, path in patterns:
+            if progress and progress.wasCanceled():
+                break
             item = QListWidgetItem(name)
-            # try to make thumbnail
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((96, int(96 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                pix = get_cached_pixmap(Path(path), (96, 96))
+            except Exception:
+                img = load_image(path)
+                pix = pil2pixmap(img.resize((96, int(96 * img.height / img.width))))
+            item.setIcon(pix)
             self.patterns_list.addItem(item)
+            i += 1
+            if progress:
+                progress.setValue(i)
+                QApplication.processEvents()
+
+        # colored emblems
         self.emblems_list.clear()
-        for name, path in sorted(self.assets["colored_emblems"].items()):
+        for name, path in colored:
+            if progress and progress.wasCanceled():
+                break
             item = QListWidgetItem(name)
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                pix = get_cached_pixmap(Path(path), (64, 64))
+            except Exception:
+                img = load_image(path)
+                pix = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
+            item.setIcon(pix)
             self.emblems_list.addItem(item)
+            i += 1
+            if progress:
+                progress.setValue(i)
+                QApplication.processEvents()
+
         # textured emblems
         self.textured_emblems_list.clear()
-        for name, path in sorted(self.assets.get("textured_emblems", {}).items()):
+        for name, path in textured:
+            if progress and progress.wasCanceled():
+                break
             item = QListWidgetItem(name)
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                pix = get_cached_pixmap(Path(path), (64, 64))
+            except Exception:
+                img = load_image(path)
+                pix = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
+            item.setIcon(pix)
             self.textured_emblems_list.addItem(item)
+            i += 1
+            if progress:
+                progress.setValue(i)
+                QApplication.processEvents()
         # clear any search filters
         try:
             self.patterns_search.setText("")
@@ -1790,6 +1898,80 @@ class MainWindow(QMainWindow):
             return
         for item in sel:
             self.scene.removeItem(item)
+    
+    def reset_canvas(self):
+        """Remove all emblems, clear pattern and reset colour pickers to defaults."""
+        # remove emblem items
+        try:
+            for it in [i for i in self.scene.items() if isinstance(i, EmblemItem)]:
+                try:
+                    self.scene.removeItem(it)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # remove pattern background if present
+        if getattr(self, "current_pattern_item", None):
+            try:
+                self.scene.removeItem(self.current_pattern_item)
+            except Exception:
+                pass
+        self.current_pattern_item = None
+        self.current_pattern_name = None
+        self._current_pattern_pil = None
+
+        # reset pattern colour pickers to sensible defaults
+        try:
+            qc1 = QColor(255, 255, 255)
+            qc2 = QColor(255, 255, 0)
+            qc3 = QColor(255, 255, 255)
+            nc = getattr(self, "named_colors", {}) or {}
+            if nc.get("white"):
+                v = nc.get("white")
+                qc1 = QColor(v[0], v[1], v[2])
+                qc3 = QColor(v[0], v[1], v[2])
+            if nc.get("yellow_mid"):
+                v = nc.get("yellow_mid")
+                qc2 = QColor(v[0], v[1], v[2])
+        except Exception:
+            qc1 = QColor(255, 255, 255)
+            qc2 = QColor(255, 255, 0)
+            qc3 = QColor(255, 255, 255)
+
+        for btn, qc in ((self.col1_btn, qc1), (self.col2_btn, qc2), (self.col3_btn, qc3)):
+            try:
+                btn._qcolor = qc
+                btn.setStyleSheet(f"background-color: {qc.name()};")
+            except Exception:
+                pass
+
+        # update controls and refresh view
+        try:
+            self.update_pattern_color_controls(1)
+            self.update_emblem_color_controls(1)
+        except Exception:
+            pass
+        try:
+            self.view.viewport().update()
+        except Exception:
+            pass
+
+        # set to default pattern (no emblems) if available
+        try:
+            default_pattern = "pattern_solid.dds"
+            if default_pattern in self.assets.get("patterns", {}):
+                for i in range(self.patterns_list.count()):
+                    it = self.patterns_list.item(i)
+                    if it and it.text() == default_pattern:
+                        try:
+                            self.patterns_list.setCurrentItem(it)
+                            self.select_pattern(it)
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
 
     def render_emblem_pixmap(self, item: EmblemItem):
         """Render an emblem PIL -> QPixmap applying recolor and pattern masking if present."""
