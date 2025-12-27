@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QInputDialog,
     QColorDialog,
     QGraphicsItem,
@@ -34,12 +35,14 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 from PySide6.QtGui import QPixmap, QImage, Qt, QDrag, QPainter, QColor
+from PySide6.QtGui import QIcon
 from PySide6.QtCore import QByteArray, QMimeData, QPointF, QSize
 
 from PIL import Image, ImageOps
 import re
 import colorsys
 import math
+import hashlib
 
 
 class DraggableListWidget(QListWidget):
@@ -205,6 +208,56 @@ def pil2pixmap(img: Image.Image):
     data = img.tobytes("raw", "RGBA")
     qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
+
+
+# Thumbnail cache directory (user cache under home)
+THUMB_CACHE_DIR = Path.home() / ".cache" / "eu5-flag-editor" / "thumbs"
+THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _thumb_cache_key(path: Path, size: tuple[int, int]):
+    """Return a cache filename derived from path, mtime and target size."""
+    try:
+        mtime = int(path.stat().st_mtime)
+    except Exception:
+        mtime = 0
+    key = f"{str(path.resolve())}|{mtime}|{size[0]}x{size[1]}"
+    h = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return THUMB_CACHE_DIR / f"{h}.png"
+
+
+def get_cached_pixmap(path: Path, max_size: tuple[int, int]):
+    """Return QPixmap from cache or generate a thumbnail and cache it."""
+    cache_path = _thumb_cache_key(path, max_size)
+    if cache_path.exists():
+        try:
+            img = Image.open(cache_path).convert("RGBA")
+            return pil2pixmap(img)
+        except Exception:
+            try:
+                cache_path.unlink()
+            except Exception:
+                pass
+    # generate and save
+    try:
+        img = Image.open(path)
+        img = img.convert("RGBA")
+        w, h = img.width, img.height
+        tw, th = max_size
+        nw = tw
+        nh = int(tw * h / w) if w else th
+        if nh > th:
+            nh = th
+            nw = int(th * w / h) if h else tw
+        thumb = img.resize((max(1, nw), max(1, nh)), Image.LANCZOS)
+        try:
+            thumb.save(cache_path, format="PNG")
+        except Exception:
+            pass
+        return pil2pixmap(thumb)
+    except Exception:
+        img = Image.new("RGBA", (max_size[0], max_size[1]), (200, 50, 50, 255))
+        return pil2pixmap(img)
 
 
 # Simple replacement of mask colors in colored emblems
@@ -1287,28 +1340,44 @@ class MainWindow(QMainWindow):
 
         # patterns
         self.patterns_list.clear()
+        idx = 0
         for name, path in sorted(self.assets["patterns"].items()):
             item = QListWidgetItem(name)
-            # try to make thumbnail
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((96, int(96 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                # load from cache or generate and cache synchronously
+                pix = get_cached_pixmap(Path(path), (96, 96))
+                item.setIcon(QIcon(pix))
+            except Exception:
+                pass
             self.patterns_list.addItem(item)
+            idx += 1
+            if progress:
+                progress.setValue(min(total, progress.value() + 1))
         self.emblems_list.clear()
         for name, path in sorted(self.assets["colored_emblems"].items()):
             item = QListWidgetItem(name)
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                pix = get_cached_pixmap(Path(path), (64, 64))
+                item.setIcon(QIcon(pix))
+            except Exception:
+                pass
             self.emblems_list.addItem(item)
+            idx += 1
+            if progress:
+                progress.setValue(min(total, progress.value() + 1))
         # textured emblems
         self.textured_emblems_list.clear()
         for name, path in sorted(self.assets.get("textured_emblems", {}).items()):
             item = QListWidgetItem(name)
-            img = load_image(path)
-            thumb = pil2pixmap(img.resize((64, int(64 * img.height / img.width))))
-            item.setIcon(thumb)
+            try:
+                pix = get_cached_pixmap(Path(path), (64, 64))
+                item.setIcon(QIcon(pix))
+            except Exception:
+                pass
             self.textured_emblems_list.addItem(item)
+            idx += 1
+            if progress:
+                progress.setValue(min(total, progress.value() + 1))
         # clear any search filters
         try:
             self.patterns_search.setText("")
