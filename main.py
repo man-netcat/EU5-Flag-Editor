@@ -216,12 +216,17 @@ MASK_COLORS = [
     (247, 0, 129),  # pink -> color3 (observed)
 ]
 
+# enable detailed recolour debug by setting env var EU5_FLAG_DEBUG_COLORS=1
+DEBUG_COLOR_RECOLOR = bool(os.environ.get("EU5_FLAG_DEBUG_COLORS"))
+
 
 def recolor_colored_emblem(img: Image.Image, color_vals):
     # color_vals: list of (r,g,b) or None, length up to 3
     px = img.convert("RGBA")
     data = px.getdata()
     out = []
+    # debug counters for mask hits
+    mask_hits = {0: 0, 1: 0, 2: 0, None: 0}
     # Precompute mask vectors
     masks = MASK_COLORS
     # use euclidean distance threshold to allow for different mask RGB values (e.g., 129 blue)
@@ -248,12 +253,57 @@ def recolor_colored_emblem(img: Image.Image, color_vals):
                 if idx < len(color_vals) and color_vals[idx] is not None
                 else (r, g, b)
             )
+            mask_hits[idx] = mask_hits.get(idx, 0) + 1
             out.append((cv[0], cv[1], cv[2], a))
         else:
+            mask_hits[None] = mask_hits.get(None, 0) + 1
             out.append((r, g, b, a))
     res = Image.new("RGBA", px.size)
     res.putdata(out)
+    if DEBUG_COLOR_RECOLOR:
+        try:
+            # compute most common output RGB colors (ignore alpha==0)
+            freq = {}
+            for (r, g, b, a) in out:
+                if a == 0:
+                    continue
+                freq[(r, g, b)] = freq.get((r, g, b), 0) + 1
+            top = sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            print(f"[RecolorDebug] mask_hits={mask_hits} color_vals={color_vals} top_colors={top}")
+            # sample a few non-transparent pixels before/after for inspection
+            sample_before = []
+            sample_after = []
+            for p_before, p_after in zip(data, out):
+                if p_before[3] == 0:
+                    continue
+                sample_before.append((p_before[0], p_before[1], p_before[2]))
+                sample_after.append((p_after[0], p_after[1], p_after[2]))
+                if len(sample_before) >= 6:
+                    break
+            print(f"[RecolorDebug] sample_before={sample_before} sample_after={sample_after}")
+        except Exception:
+            pass
     return res
+
+
+def _normalize_color_tuple(col):
+    """Normalize a color tuple which may be (0-1 floats) or (0-255 ints).
+
+    Returns a (r,g,b) tuple with integers 0-255 or None if input invalid/None.
+    """
+    if not col:
+        return None
+    try:
+        # if floats in 0..1 range
+        if all(isinstance(x, float) and 0.0 <= x <= 1.0 for x in col):
+            return (int(col[0] * 255), int(col[1] * 255), int(col[2] * 255))
+        # if already ints 0..255
+        if all(isinstance(x, int) for x in col):
+            return (int(col[0]), int(col[1]), int(col[2]))
+        # fallback: try numeric conversion
+        return (int(col[0]), int(col[1]), int(col[2]))
+    except Exception:
+        return None
 
 
 def recolor_pattern(
@@ -485,6 +535,10 @@ class EmblemItem(QGraphicsPixmapItem):
         # mirroring flags
         self.mirror_x = False
         self.mirror_y = False
+        # rotation (degrees clockwise)
+        self.rotation = 0.0
+        # mask slots (list of ints) used to mask this emblem by current pattern
+        self.mask_slots = []
         # per-emblem color values as (r,g,b) 0-255 or None; index 0..2
         self.color_vals = [None, None, None]
         self.update_pixmap()
@@ -559,6 +613,13 @@ class EmblemItem(QGraphicsPixmapItem):
         if s > 1.0:
             s = 1.0
         self.scale_y = s
+        return
+
+    def set_rotation(self, deg: float):
+        try:
+            self.rotation = float(deg)
+        except Exception:
+            return
         return
 
 
@@ -818,14 +879,50 @@ class MainWindow(QMainWindow):
         self.mirror_y_btn.clicked.connect(self.mirror_y_toggled)
         mirror_row.addWidget(self.mirror_x_btn)
         mirror_row.addWidget(self.mirror_y_btn)
+        # mask button
+        self.mask_btn = QPushButton("Mask...")
+        self.mask_btn.clicked.connect(self.set_mask_for_selected)
+        mirror_row.addWidget(self.mask_btn)
         mirror_row.addStretch()
         right.addLayout(mirror_row)
 
+        # Rotation control
+        rot_row = QHBoxLayout()
+        rot_label = QLabel("Rotation (°)")
+        self.rotation_spin = QSpinBox()
+        self.rotation_spin.setRange(-180, 180)
+        self.rotation_spin.setValue(0)
+        self.rotation_spin.setSuffix("°")
+        self.rotation_spin.setFixedWidth(100)
+        self.rotation_spin.valueChanged.connect(self.rotation_changed)
+        rot_row.addWidget(rot_label)
+        rot_row.addWidget(self.rotation_spin)
+        rot_row.addStretch()
+        right.addLayout(rot_row)
+
         # wire up synchronization: sliders <-> spinboxes and handlers
-        self.scale_x_spin.valueChanged.connect(lambda v: self.scale_x_slider.setValue(v))
-        self.scale_x_slider.valueChanged.connect(lambda v: (self.scale_x_spin.blockSignals(True), self.scale_x_spin.setValue(v), self.scale_x_spin.blockSignals(False), self.scale_x_changed(v)))
-        self.scale_y_spin.valueChanged.connect(lambda v: self.scale_y_slider.setValue(v))
-        self.scale_y_slider.valueChanged.connect(lambda v: (self.scale_y_spin.blockSignals(True), self.scale_y_spin.setValue(v), self.scale_y_spin.blockSignals(False), self.scale_y_changed(v)))
+        self.scale_x_spin.valueChanged.connect(
+            lambda v: self.scale_x_slider.setValue(v)
+        )
+        self.scale_x_slider.valueChanged.connect(
+            lambda v: (
+                self.scale_x_spin.blockSignals(True),
+                self.scale_x_spin.setValue(v),
+                self.scale_x_spin.blockSignals(False),
+                self.scale_x_changed(v),
+            )
+        )
+        self.scale_y_spin.valueChanged.connect(
+            lambda v: self.scale_y_slider.setValue(v)
+        )
+        self.scale_y_slider.valueChanged.connect(
+            lambda v: (
+                self.scale_y_spin.blockSignals(True),
+                self.scale_y_spin.setValue(v),
+                self.scale_y_spin.blockSignals(False),
+                self.scale_y_changed(v),
+            )
+        )
 
         # center controls: center both axes or individually
         ctr_row = QHBoxLayout()
@@ -847,6 +944,12 @@ class MainWindow(QMainWindow):
         delete_btn.setToolTip("Remove the selected emblem from the canvas")
         delete_btn.clicked.connect(self.delete_selected)
         right.addWidget(delete_btn)
+
+        # Import/Export CoA buttons
+        import_btn = QPushButton("Import CoA Block")
+        import_btn.setToolTip("Import a CoA block from the clipboard")
+        import_btn.clicked.connect(self.import_coa)
+        right.addWidget(import_btn)
 
         export_btn = QPushButton("Export CoA Block")
         export_btn.clicked.connect(self.export_coa)
@@ -1046,9 +1149,13 @@ class MainWindow(QMainWindow):
             self.em_col1_btn.setStyleSheet(f"background-color: {c.name()};")
             item.set_color(0, c)
             self.update_emblem_pixmap(item)
-            # save this choice for this emblem texture
+            # save this choice for this emblem texture (normalize values)
             try:
-                self.emblem_saved_colors[item.image_path.name] = list(item.color_vals)
+                vals = [
+                    _normalize_color_tuple(v) if v is not None else None
+                    for v in item.color_vals
+                ]
+                self.emblem_saved_colors[item.image_path.name] = vals
             except Exception:
                 pass
 
@@ -1077,7 +1184,11 @@ class MainWindow(QMainWindow):
             item.set_color(1, c)
             self.update_emblem_pixmap(item)
             try:
-                self.emblem_saved_colors[item.image_path.name] = list(item.color_vals)
+                vals = [
+                    _normalize_color_tuple(v) if v is not None else None
+                    for v in item.color_vals
+                ]
+                self.emblem_saved_colors[item.image_path.name] = vals
             except Exception:
                 pass
 
@@ -1105,12 +1216,76 @@ class MainWindow(QMainWindow):
             self.em_col3_btn.setStyleSheet(f"background-color: {c.name()};")
             item.set_color(2, c)
             try:
-                self.emblem_saved_colors[item.image_path.name] = list(item.color_vals)
+                vals = [
+                    _normalize_color_tuple(v) if v is not None else None
+                    for v in item.color_vals
+                ]
+                self.emblem_saved_colors[item.image_path.name] = vals
             except Exception:
                 pass
             self.update_emblem_pixmap(item)
 
+    def set_mask_for_selected(self):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            QMessageBox.information(self, "Mask", "Select an emblem first")
+            return
+        item = sel[0]
+        text, ok = QInputDialog.getText(
+            self,
+            "Mask slots",
+            "Enter mask slots (space-separated integers), or leave blank to clear:",
+        )
+        if not ok:
+            return
+        text = (text or "").strip()
+        if not text:
+            item.mask_slots = []
+            self.mask_btn.setText("Mask...")
+            self.update_emblem_pixmap(item)
+            return
+        parts = re.split(r"\s+", text)
+        slots = []
+        for p in parts:
+            try:
+                v = int(p)
+                if v >= 1:
+                    slots.append(v)
+            except Exception:
+                continue
+        item.mask_slots = slots
+        self.mask_btn.setText("Mask: " + " ".join(str(s) for s in slots))
+        self.update_emblem_pixmap(item)
+
+    def rotation_changed(self, val: int):
+        sel = [i for i in self.scene.selectedItems() if isinstance(i, EmblemItem)]
+        if not sel:
+            return
+        for item in sel:
+            item.set_rotation(val)
+            try:
+                self.update_emblem_pixmap(item)
+            except Exception:
+                pass
+
     def populate_lists(self):
+        # Build a flattened list of assets to generate thumbnails for, then show progress
+        patterns = sorted(self.assets.get("patterns", {}).items())
+        colored = sorted(self.assets.get("colored_emblems", {}).items())
+        textured = sorted(self.assets.get("textured_emblems", {}).items())
+
+        total = len(patterns) + len(colored) + len(textured)
+        progress = None
+        if total > 8:
+            progress = QProgressDialog(
+                "Generating thumbnails...", "Cancel", 0, total, self
+            )
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(200)
+            progress.setAutoClose(True)
+            progress.setValue(0)
+
+        # patterns
         self.patterns_list.clear()
         for name, path in sorted(self.assets["patterns"].items()):
             item = QListWidgetItem(name)
@@ -1175,7 +1350,9 @@ class MainWindow(QMainWindow):
         self.settings_window = SettingsWindow(self)
         self.settings_window.show()
 
-    def _double_click_add_from_list(self, lst: DraggableListWidget, item: QListWidgetItem):
+    def _double_click_add_from_list(
+        self, lst: DraggableListWidget, item: QListWidgetItem
+    ):
         # Helper for double-click: add emblem from specified list
         name = item.text()
         path = self.assets.get(lst.asset_type, {}).get(name)
@@ -1237,7 +1414,15 @@ class MainWindow(QMainWindow):
         pil = recolor_pattern(
             img, c1, c2, c3, masks=getattr(self, "_current_pattern_masks", None)
         )
-        pix = pil2pixmap(pil)
+        # ensure transparent areas of patterns are filled with colour1 so background
+        # doesn't appear as empty/white in the canvas
+        try:
+            bg = Image.new("RGBA", pil.size, (c1[0], c1[1], c1[2], 255))
+            bg.paste(pil, (0, 0), pil)
+            pil_f = bg
+        except Exception:
+            pil_f = pil
+        pix = pil2pixmap(pil_f)
         # remove old background
         if self.current_pattern_item:
             self.scene.removeItem(self.current_pattern_item)
@@ -1262,7 +1447,9 @@ class MainWindow(QMainWindow):
         self._current_pattern_pil = img
         # determine how many colour slots this pattern uses and update controls
         try:
-            slots = self._determine_pattern_slots(img, getattr(self, "_current_pattern_masks", None))
+            slots = self._determine_pattern_slots(
+                img, getattr(self, "_current_pattern_masks", None)
+            )
         except Exception:
             slots = 1
         self.update_pattern_color_controls(slots)
@@ -1285,6 +1472,13 @@ class MainWindow(QMainWindow):
             c3,
             masks=getattr(self, "_current_pattern_masks", None),
         )
+        # fill transparent pattern areas with colour1 so canvas has a solid background
+        try:
+            bg = Image.new("RGBA", pil.size, (c1[0], c1[1], c1[2], 255))
+            bg.paste(pil, (0, 0), pil)
+            pil = bg
+        except Exception:
+            pass
         pil = pil.resize((CANVAS_W, CANVAS_H))
         pix = pil2pixmap(pil)
         self.current_pattern_item.setPixmap(pix)
@@ -1308,7 +1502,11 @@ class MainWindow(QMainWindow):
                 best = None
                 bestd = None
                 for col, cnt in counts.items():
-                    d = (col[0] - target[0]) ** 2 + (col[1] - target[1]) ** 2 + (col[2] - target[2]) ** 2
+                    d = (
+                        (col[0] - target[0]) ** 2
+                        + (col[1] - target[1]) ** 2
+                        + (col[2] - target[2]) ** 2
+                    )
                     if bestd is None or d < bestd:
                         bestd = d
                         best = (col, cnt, d)
@@ -1403,8 +1601,11 @@ class MainWindow(QMainWindow):
             try:
                 saved = self.emblem_saved_colors.get(it.image_path.name)
                 if saved:
-                    # ensure list length 3
-                    it.color_vals = list(saved[:3]) + [None] * (3 - len(saved))
+                    # ensure list length 3 and normalize values to 0-255 ints
+                    vals = list(saved[:3]) + [None] * (3 - len(saved))
+                    it.color_vals = [
+                        _normalize_color_tuple(v) if v is not None else None for v in vals
+                    ]
                 else:
                     # no saved colors: infer which mask slots are actually present in the emblem
                     inferred = infer_emblem_mask_colors(it.base_image)
@@ -1412,9 +1613,7 @@ class MainWindow(QMainWindow):
                     if inferred:
                         for idx in range(min(3, len(inferred))):
                             if inferred[idx]:
-                                new_vals[idx] = (
-                                    inferred[idx][0], inferred[idx][1], inferred[idx][2]
-                                )
+                                new_vals[idx] = _normalize_color_tuple(inferred[idx])
                     it.color_vals = new_vals
             except Exception:
                 # fallback: leave color_vals as None
@@ -1530,7 +1729,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "current_pattern_name", None):
             pattern_name = self.current_pattern_name
             # default CoA key (tag) — user indicated tag is not important
-            name = 'TAG'
+            name = "TAG"
         # build block
         lines = [f"{name} = {{"]
         # pattern: prompt user for file name or leave blank
@@ -1558,9 +1757,52 @@ class MainWindow(QMainWindow):
         pattern_c2 = qc_to_rgb_tuple(qc2)
         pattern_c3 = qc_to_rgb_tuple(qc3)
 
-        def fmt_rgb_line(name, rgb):
+        def find_named_color(rgb):
+            # try to match rgb tuple (0-255) to a named color (self.named_colors values are 0-1)
+            if not rgb or not getattr(self, "named_colors", None):
+                return None
+            try:
+                rr = rgb[0] / 255.0
+                gg = rgb[1] / 255.0
+            except Exception:
+                return None
+            bb = rgb[2] / 255.0
+            best = None
+            bestd = None
+            for name, v in (self.named_colors or {}).items():
+                try:
+                    dr = rr - v[0]
+                    dg = gg - v[1]
+                    db = bb - v[2]
+                    d = dr * dr + dg * dg + db * db
+                    if bestd is None or d < bestd:
+                        bestd = d
+                        best = name
+                except Exception:
+                    continue
+            # threshold: require reasonably close (squared distance)
+            if bestd is not None and bestd <= (0.02 * 0.02 * 3):
+                return best
+            return None
+
+        def fmt_rgb_line(name, rgb, alias_map=None):
+            # alias_map: mapping of color slot names to previously emitted token (e.g., 'color1'->'color1')
             if rgb is None:
                 return None
+            # try to find named color
+            named = find_named_color(rgb)
+            if named:
+                return f'    {name} = "{named}"'
+            # try aliasing to previous slots if identical
+            if alias_map:
+                for other_name, other_rgb in alias_map.items():
+                    if (
+                        other_rgb
+                        and int(other_rgb[0]) == int(rgb[0])
+                        and int(other_rgb[1]) == int(rgb[1])
+                        and int(other_rgb[2]) == int(rgb[2])
+                    ):
+                        return f"    {name} = {other_name}"
             r = int(rgb[0])
             g = int(rgb[1])
             b = int(rgb[2])
@@ -1571,7 +1813,8 @@ class MainWindow(QMainWindow):
             if getattr(self, "_current_pattern_pil", None):
                 # use robust detection which checks color proximity and frequencies
                 pattern_slots = self._determine_pattern_slots(
-                    self._current_pattern_pil, getattr(self, "_current_pattern_masks", None)
+                    self._current_pattern_pil,
+                    getattr(self, "_current_pattern_masks", None),
                 )
             else:
                 pattern_slots = 1
@@ -1579,18 +1822,22 @@ class MainWindow(QMainWindow):
             pattern_slots = 1
 
         # emit pattern color lines only for slots actually used
+        alias_map = {}
         if pattern_slots >= 1:
-            c1_line = fmt_rgb_line("color1", pattern_c1)
+            c1_line = fmt_rgb_line("color1", pattern_c1, alias_map)
             if c1_line:
                 lines.append(c1_line)
+                alias_map["color1"] = pattern_c1
         if pattern_slots >= 2:
-            c2_line = fmt_rgb_line("color2", pattern_c2)
+            c2_line = fmt_rgb_line("color2", pattern_c2, alias_map)
             if c2_line:
                 lines.append(c2_line)
+                alias_map["color2"] = pattern_c2
         if pattern_slots >= 3:
-            c3_line = fmt_rgb_line("color3", pattern_c3)
+            c3_line = fmt_rgb_line("color3", pattern_c3, alias_map)
             if c3_line:
                 lines.append(c3_line)
+                alias_map["color3"] = pattern_c3
         # iterate through scene items in z-order (lowest to highest), excluding background
         emblems = [i for i in self.scene.items() if isinstance(i, EmblemItem)]
         # sort by zValue to preserve layering
@@ -1635,7 +1882,11 @@ class MainWindow(QMainWindow):
                         rgb_to_use = ev[idx]
                     elif saved and idx < len(saved) and saved[idx]:
                         rgb_to_use = saved[idx]
-                    elif inferred_emblem and idx < len(inferred_emblem) and inferred_emblem[idx]:
+                    elif (
+                        inferred_emblem
+                        and idx < len(inferred_emblem)
+                        and inferred_emblem[idx]
+                    ):
                         rgb_to_use = inferred_emblem[idx]
 
                     if not rgb_to_use:
@@ -1661,6 +1912,16 @@ class MainWindow(QMainWindow):
             lines.append("        instance = {")
             lines.append(f"            position = {{ {center_x:.3f} {center_y:.3f} }}")
             lines.append(f"            scale = {{ {scale_x:.3f} {scale_y:.3f} }}")
+            # optional rotation (degrees clockwise)
+            rot = float(getattr(e, "rotation", 0.0) or 0.0)
+            if rot != 0.0:
+                lines.append(f"            rotation = {{ {rot:.1f} }}")
+            # optional mask slots
+            ms = getattr(e, "mask_slots", []) or []
+            if ms:
+                lines.append(
+                    "            mask = { " + " ".join(str(int(x)) for x in ms) + " }"
+                )
             lines.append("        }")
             lines.append("    }")
         lines.append("}")
@@ -1673,6 +1934,439 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "Exported", "Generated CoA block (clipboard copy failed)"
             )
+
+    def import_coa(self):
+        """Import a CoA block from the clipboard.
+
+        This will try to detect a pattern filename (*.dds) and up to three
+        `rgb { r g b }` colour lines from the clipboard text and apply them
+        to the current canvas if matching assets are available.
+        """
+        txt = QApplication.clipboard().text() or ""
+        if not txt.strip():
+            QMessageBox.information(self, "Import CoA", "Clipboard is empty")
+            return
+
+        # Reset scene and pattern state before importing so import is deterministic
+        try:
+            # remove all existing items (pattern background + emblems)
+            self.scene.clear()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "current_pattern_item", None):
+                try:
+                    # ensure reference removed
+                    self.current_pattern_item = None
+                except Exception:
+                    self.current_pattern_item = None
+        except Exception:
+            pass
+        # reset stored pattern state
+        try:
+            self.current_pattern_name = None
+        except Exception:
+            pass
+        try:
+            self._current_pattern_pil = None
+            self._current_pattern_masks = (None, None, None)
+        except Exception:
+            pass
+        # reset pattern colour pickers to sensible defaults
+        try:
+            from PySide6.QtGui import QColor
+
+            self.col1_btn._qcolor = QColor(255, 255, 255)
+            self.col1_btn.setStyleSheet(f"background-color: {QColor(255,255,255).name()};")
+            self.col2_btn._qcolor = QColor(255, 255, 0)
+            self.col2_btn.setStyleSheet(f"background-color: {QColor(255,255,0).name()};")
+            self.col3_btn._qcolor = QColor(255, 255, 255)
+            self.col3_btn.setStyleSheet(f"background-color: {QColor(255,255,255).name()};")
+        except Exception:
+            pass
+
+        # try to find an explicit pattern assignment first: pattern = "name.dds"
+        m = re.search(r'pattern\s*=\s*["\']?([^"\']+?\.dds)["\']?', txt, re.IGNORECASE)
+        if not m:
+            # fallback: find any .dds filename in the text
+            m = re.search(r'["\']?([^"\']+?\.dds)["\']?', txt, re.IGNORECASE)
+        if m:
+            pname = os.path.basename(m.group(1))
+            patterns = self.assets.get("patterns", {})
+            if pname in patterns:
+                # select and display the pattern
+                items = self.patterns_list.findItems(pname, Qt.MatchExactly)
+                if items:
+                    try:
+                        self.patterns_list.setCurrentItem(items[0])
+                        self.select_pattern(items[0])
+                    except Exception:
+                        pass
+            else:
+                QMessageBox.information(
+                    self, "Import CoA", f'Pattern "{pname}" not found in assets'
+                )
+
+        # parse top-level pattern color assignments (color1/color2/color3)
+        # Only consider assignments before any emblem blocks so per-emblem
+        # color lines don't override the pattern colours.
+        color_assigns = {}
+        head_txt = txt
+        mblk = re.search(r'(?:colored_emblem|textured_emblem)\s*=', txt, re.IGNORECASE)
+        if mblk:
+            head_txt = txt[: mblk.start()]
+        for m in re.finditer(
+            r'(color[123])\s*=\s*(?:rgb\s*\{\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s*\}|"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))',
+            head_txt,
+            re.IGNORECASE,
+        ):
+            key = m.group(1).lower()
+            # groups: 2,3,4 => rgb numbers; 5 => quoted name; 6 => unquoted token
+            if m.group(2) and m.group(3) and m.group(4):
+                try:
+                    r = int(m.group(2))
+                    g = int(m.group(3))
+                    b = int(m.group(4))
+                    color_assigns[key] = (r, g, b)
+                except Exception:
+                    continue
+            elif m.group(5):
+                color_assigns[key] = ("named", m.group(5))
+            elif m.group(6):
+                token = m.group(6)
+                if token.lower().startswith("color"):
+                    color_assigns[key] = ("alias", token.lower())
+                else:
+                    color_assigns[key] = ("named", token)
+
+        # resolve assignments into actual QColor values
+        resolved = {}
+
+        # helper to resolve potential aliases
+        def resolve_color_token(tok, _seen=None):
+            # prevent infinite alias recursion by tracking seen alias keys
+            if _seen is None:
+                _seen = set()
+            if not tok:
+                return None
+            # support three shapes of token values:
+            # - (r,g,b) numeric tuple
+            # - ("named", name)
+            # - ("alias", "color1")
+            # handle numeric tuple first
+            if isinstance(tok, tuple) and len(tok) >= 3 and isinstance(tok[0], (int, float)):
+                try:
+                    r = int(tok[0])
+                    g = int(tok[1])
+                    b = int(tok[2])
+                    return QColor(r, g, b)
+                except Exception:
+                    return None
+
+            if isinstance(tok, tuple) and len(tok) >= 2 and isinstance(tok[0], str):
+                if tok[0] == "named":
+                    name = tok[1]
+                    # try named_colors (values stored as 0..1 floats)
+                    nc = (self.named_colors or {}).get(name)
+                    if nc:
+                        return QColor(int(nc[0] * 255), int(nc[1] * 255), int(nc[2] * 255))
+                    # fallback common names
+                    common = {
+                        "black": (0, 0, 0),
+                        "white": (255, 255, 255),
+                        "red": (255, 0, 0),
+                        "yellow": (255, 255, 0),
+                        "blue": (0, 0, 255),
+                        "green": (0, 255, 0),
+                    }
+                    c = common.get(name.lower())
+                    if c:
+                        return QColor(c[0], c[1], c[2])
+                    return None
+                if tok[0] == "alias":
+                    alias_key = tok[1]
+                    if alias_key in _seen:
+                        return None
+                    _seen.add(alias_key)
+                    return resolve_color_token(color_assigns.get(alias_key), _seen)
+            return None
+
+        for slot in ("color1", "color2", "color3"):
+            val = color_assigns.get(slot)
+            qc = resolve_color_token(val)
+            if qc:
+                if slot == "color1":
+                    btn = self.col1_btn
+                elif slot == "color2":
+                    btn = self.col2_btn
+                else:
+                    btn = self.col3_btn
+                btn._qcolor = qc
+                btn.setStyleSheet(f"background-color: {qc.name()};")
+        try:
+            self._update_pattern_display()
+        except Exception:
+            pass
+
+        QMessageBox.information(
+            self, "Import CoA", "Imported pattern/colour data from clipboard"
+        )
+        # Now parse emblem blocks and recreate emblem instances (preserve z-order)
+        # Remove existing emblem items
+        try:
+            for it in [i for i in self.scene.items() if isinstance(i, EmblemItem)]:
+                self.scene.removeItem(it)
+        except Exception:
+            pass
+
+        # collect emblem blocks using simple brace matching to handle nested blocks
+        lines = txt.splitlines()
+        i = 0
+        blocks = []  # list of (type, block_text)
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.lower().startswith("colored_emblem") or line.lower().startswith(
+                "textured_emblem"
+            ):
+                typ = (
+                    "colored"
+                    if line.lower().startswith("colored_emblem")
+                    else "textured"
+                )
+                # consume until matching braces closed
+                brace = 0
+                blk_lines = []
+                # advance until first '{'
+                while i < len(lines):
+                    l = lines[i]
+                    blk_lines.append(l)
+                    brace += l.count("{") - l.count("}")
+                    i += 1
+                    if brace == 0:
+                        break
+                blocks.append((typ, "\n".join(blk_lines)))
+                continue
+            i += 1
+
+        # Add emblems in the order they were exported (blocks list order)
+        z = 0
+        for typ, blk in blocks:
+            # parse texture name
+            m = re.search(r'texture\s*=\s*["\']?([^"\']+)["\']?', blk, re.IGNORECASE)
+            if not m:
+                continue
+            texname = os.path.basename(m.group(1))
+            # find texture path in assets
+            asset_map = self.assets.get(
+                "colored_emblems" if typ == "colored" else "textured_emblems", {}
+            )
+            path = asset_map.get(texname)
+            if not path:
+                # try the other list as fallback
+                other_map = self.assets.get(
+                    "textured_emblems" if typ == "colored" else "colored_emblems", {}
+                )
+                path = other_map.get(texname)
+                if path:
+                    # adjust type based on where found
+                    typ = (
+                        "colored"
+                        if other_map is self.assets.get("colored_emblems")
+                        else "textured"
+                    )
+            if not path:
+                # cannot find texture, skip
+                continue
+
+            # parse per-emblem colors (support rgb, named, or alias to pattern colors)
+            colors = [None, None, None]
+            for idx in range(3):
+                cname = f"color{idx+1}"
+                mcol = re.search(
+                    rf'{cname}\s*=\s*(?:rgb\s*\{{\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s*\}}|"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))',
+                    blk,
+                    re.IGNORECASE,
+                )
+                if not mcol:
+                    continue
+                # groups: 1,2,3 -> rgb numbers; 4 -> quoted name; 5 -> unquoted token
+                if mcol.group(1) and mcol.group(2) and mcol.group(3):
+                    try:
+                        colors[idx] = (
+                            int(mcol.group(1)), int(mcol.group(2)), int(mcol.group(3))
+                        )
+                    except Exception:
+                        colors[idx] = None
+                    continue
+                token = mcol.group(4) or mcol.group(5)
+                if not token:
+                    continue
+                token = token.strip()
+                # alias to pattern color (e.g., color1)
+                if token.lower().startswith("color"):
+                    try:
+                        qc = resolve_color_token(color_assigns.get(token.lower()))
+                        if qc:
+                            colors[idx] = (qc.red(), qc.green(), qc.blue())
+                        else:
+                            colors[idx] = None
+                    except Exception:
+                        colors[idx] = None
+                    continue
+                # named color lookup
+                try:
+                    nc = (self.named_colors or {}).get(token)
+                    if nc:
+                        colors[idx] = (int(nc[0] * 255), int(nc[1] * 255), int(nc[2] * 255))
+                    else:
+                        colors[idx] = None
+                except Exception:
+                    colors[idx] = None
+
+            # parse instance position and scale
+            cx = cy = None
+            sx = sy = 1.0
+            mpos = re.search(
+                r"position\s*=\s*\{\s*([0-9\.]+)\s+([0-9\.]+)\s*\}", blk, re.IGNORECASE
+            )
+            if mpos:
+                try:
+                    cx = float(mpos.group(1))
+                    cy = float(mpos.group(2))
+                except Exception:
+                    cx = cy = None
+            mscale = re.search(
+                r"scale\s*=\s*\{\s*([0-9\.]+)\s+([0-9\.]+)\s*\}", blk, re.IGNORECASE
+            )
+            if mscale:
+                try:
+                    sx = float(mscale.group(1))
+                    sy = float(mscale.group(2))
+                except Exception:
+                    sx = sy = 1.0
+            # parse rotation and mask
+            rotation = 0.0
+            mrot = re.search(
+                r"rotation\s*=\s*\{\s*([0-9\.-]+)\s*\}", blk, re.IGNORECASE
+            )
+            if mrot:
+                try:
+                    rotation = float(mrot.group(1))
+                except Exception:
+                    rotation = 0.0
+            mask_slots = []
+            mmask = re.search(r"mask\s*=\s*\{\s*([^}]+)\s*\}", blk, re.IGNORECASE)
+            if mmask:
+                try:
+                    parts = re.split(r"\s+", mmask.group(1).strip())
+                    for p in parts:
+                        try:
+                            v = int(p)
+                            if v >= 1:
+                                mask_slots.append(v)
+                        except Exception:
+                            continue
+                except Exception:
+                    mask_slots = []
+
+            # create emblem
+            try:
+                pil = load_image(path)
+                item = EmblemItem(Path(path), pil, texture_type=typ)
+                # DEBUG: log parsed values to help troubleshooting
+                try:
+                    print(
+                        f"[Import] emblem={texname} typ={typ} parsed_colors={colors} sx={sx} sy={sy} rot={rotation} mask={mask_slots} pos=({cx},{cy})"
+                    )
+                except Exception:
+                    pass
+                # apply colours for colored emblems
+                if typ == "colored":
+                    for idx in range(3):
+                        if colors[idx]:
+                            item.color_vals[idx] = _normalize_color_tuple(colors[idx])
+                # DEBUG: log normalized item color_vals
+                try:
+                    print(f"[Import] assigned_color_vals={item.color_vals}")
+                except Exception:
+                    pass
+                    # persist saved per-texture colors (normalize)
+                    try:
+                        vals = [
+                            _normalize_color_tuple(v) if v is not None else None
+                            for v in item.color_vals
+                        ]
+                        self.emblem_saved_colors[item.image_path.name] = vals
+                    except Exception:
+                        pass
+
+                # set scale using setters to enforce bounds
+                try:
+                    item.set_scale_x(sx)
+                except Exception:
+                    item.scale_x = sx
+                try:
+                    item.set_scale_y(sy)
+                except Exception:
+                    item.scale_y = sy
+                # set rotation and mask via setters
+                try:
+                    item.set_rotation(rotation)
+                except Exception:
+                    item.rotation = rotation
+                try:
+                    item.mask_slots = mask_slots
+                except Exception:
+                    item.mask_slots = []
+                # render pixmap with recolor/scale/mirroring so pixmap size is correct
+                try:
+                    self.update_emblem_pixmap(item)
+                except Exception:
+                    pass
+                # compute position
+                # if center coords provided, convert to top-left using current pixmap size
+                if cx is not None and cy is not None:
+                    pix = item.pixmap()
+                    w = pix.width()
+                    h = pix.height()
+                    tx = cx * CANVAS_W - w / 2
+                    ty = cy * CANVAS_H - h / 2
+                    item.setPos(QPointF(tx, ty))
+                else:
+                    # default center
+                    pix = item.pixmap()
+                    item.setPos(
+                        QPointF(
+                            (CANVAS_W - pix.width()) / 2, (CANVAS_H - pix.height()) / 2
+                        )
+                    )
+
+                item.setZValue(z)
+                z += 1
+                self.scene.addItem(item)
+                # ensure pixmap reflects final state after being added
+                try:
+                    self.update_emblem_pixmap(item)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+        # refresh view and scene after import so all pixmaps and UI reflect changes
+        try:
+            self.scene.update()
+        except Exception:
+            pass
+        try:
+            self.view.viewport().update()
+        except Exception:
+            pass
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        QMessageBox.information(self, "Import CoA", "Imported emblems from CoA block")
 
     def on_selection_changed(self):
         try:
@@ -1712,6 +2406,22 @@ class MainWindow(QMainWindow):
             self.mirror_y_btn.setChecked(bool(getattr(item, "mirror_y", False)))
         except Exception:
             pass
+        # update rotation and mask UI
+        try:
+            rot = float(getattr(item, "rotation", 0.0))
+            self.rotation_spin.blockSignals(True)
+            self.rotation_spin.setValue(int(rot))
+            self.rotation_spin.blockSignals(False)
+        except Exception:
+            pass
+        try:
+            ms = getattr(item, "mask_slots", []) or []
+            if ms:
+                self.mask_btn.setText("Mask: " + " ".join(str(s) for s in ms))
+            else:
+                self.mask_btn.setText("Mask...")
+        except Exception:
+            pass
         # textured emblems have no colors: hide controls and disable swatches
         if getattr(item, "texture_type", "colored") != "colored":
             self.update_emblem_color_controls(0)
@@ -1733,7 +2443,11 @@ class MainWindow(QMainWindow):
         # enable and set swatches for visible emblem buttons
         global_c1 = getattr(self.col1_btn, "_qcolor", QColor(255, 255, 255))
         global_c2 = getattr(self.col2_btn, "_qcolor", QColor(255, 255, 255))
-        inferred = infer_emblem_mask_colors(item.base_image) if item.base_image else MASK_COLORS
+        inferred = (
+            infer_emblem_mask_colors(item.base_image)
+            if item.base_image
+            else MASK_COLORS
+        )
         for idx, b in enumerate((self.em_col1_btn, self.em_col2_btn, self.em_col3_btn)):
             if not b.isVisible():
                 b.setEnabled(False)
@@ -1744,7 +2458,11 @@ class MainWindow(QMainWindow):
                 qc = QColor(int(cv[0]), int(cv[1]), int(cv[2]))
             else:
                 if inferred and idx < len(inferred) and inferred[idx]:
-                    qc = QColor(int(inferred[idx][0]), int(inferred[idx][1]), int(inferred[idx][2]))
+                    qc = QColor(
+                        int(inferred[idx][0]),
+                        int(inferred[idx][1]),
+                        int(inferred[idx][2]),
+                    )
                 else:
                     if idx == 0:
                         qc = global_c1
@@ -1791,6 +2509,84 @@ class MainWindow(QMainWindow):
         for item in sel:
             self.scene.removeItem(item)
 
+    def reset_canvas(self):
+        """Remove all emblems, clear pattern and reset colour pickers to defaults."""
+        # remove emblem items
+        try:
+            for it in [i for i in self.scene.items() if isinstance(i, EmblemItem)]:
+                try:
+                    self.scene.removeItem(it)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # remove pattern background if present
+        if getattr(self, "current_pattern_item", None):
+            try:
+                self.scene.removeItem(self.current_pattern_item)
+            except Exception:
+                pass
+        self.current_pattern_item = None
+        self.current_pattern_name = None
+        self._current_pattern_pil = None
+
+        # reset pattern colour pickers to sensible defaults
+        try:
+            qc1 = QColor(255, 255, 255)
+            qc2 = QColor(255, 255, 0)
+            qc3 = QColor(255, 255, 255)
+            nc = getattr(self, "named_colors", {}) or {}
+            if nc.get("white"):
+                v = nc.get("white")
+                qc1 = QColor(v[0], v[1], v[2])
+                qc3 = QColor(v[0], v[1], v[2])
+            if nc.get("yellow_mid"):
+                v = nc.get("yellow_mid")
+                qc2 = QColor(v[0], v[1], v[2])
+        except Exception:
+            qc1 = QColor(255, 255, 255)
+            qc2 = QColor(255, 255, 0)
+            qc3 = QColor(255, 255, 255)
+
+        for btn, qc in (
+            (self.col1_btn, qc1),
+            (self.col2_btn, qc2),
+            (self.col3_btn, qc3),
+        ):
+            try:
+                btn._qcolor = qc
+                btn.setStyleSheet(f"background-color: {qc.name()};")
+            except Exception:
+                pass
+
+        # update controls and refresh view
+        try:
+            self.update_pattern_color_controls(1)
+            self.update_emblem_color_controls(1)
+        except Exception:
+            pass
+        try:
+            self.view.viewport().update()
+        except Exception:
+            pass
+
+        # set to default pattern (no emblems) if available
+        try:
+            default_pattern = "pattern_solid.dds"
+            if default_pattern in self.assets.get("patterns", {}):
+                for i in range(self.patterns_list.count()):
+                    it = self.patterns_list.item(i)
+                    if it and it.text() == default_pattern:
+                        try:
+                            self.patterns_list.setCurrentItem(it)
+                            self.select_pattern(it)
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
     def render_emblem_pixmap(self, item: EmblemItem):
         """Render an emblem PIL -> QPixmap applying recolor and pattern masking if present."""
         # recolor emblem
@@ -1820,14 +2616,135 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # NOTE: emblem masking by pattern disabled — emblems are drawn above the pattern
+        # apply pattern-based masking if requested and pattern available
+        try:
+            if getattr(item, "mask_slots", None) and getattr(
+                self, "_current_pattern_pil", None
+            ):
+                slots = set(item.mask_slots or [])
+                # compute top-left in pattern coords from item's scene position
+                try:
+                    pos = item.pos()
+                    tx = int(pos.x())
+                    ty = int(pos.y())
+                except Exception:
+                    tx = 0
+                    ty = 0
+
+                # crop pattern region corresponding to emblem size
+                pat = self._current_pattern_pil.convert("RGBA")
+                ew, eh = pil.width, pil.height
+                # create a transparent crop same size
+                try:
+                    # ensure crop box within pattern bounds
+                    box = (tx, ty, tx + ew, ty + eh)
+                    crop = Image.new("RGBA", (ew, eh), (0, 0, 0, 0))
+                    # attempt to paste overlapped area
+                    pat_w, pat_h = pat.size
+                    inter_l = max(0, tx)
+                    inter_t = max(0, ty)
+                    inter_r = min(pat_w, tx + ew)
+                    inter_b = min(pat_h, ty + eh)
+                    if inter_r > inter_l and inter_b > inter_t:
+                        region = pat.crop((inter_l, inter_t, inter_r, inter_b))
+                        paste_x = inter_l - tx
+                        paste_y = inter_t - ty
+                        crop.paste(region, (paste_x, paste_y))
+                except Exception:
+                    crop = Image.new("RGBA", (ew, eh), (0, 0, 0, 0))
+
+                # determine mask canonical colors
+                masks = getattr(self, "_current_pattern_masks", None)
+                if not masks:
+                    masks = detect_pattern_mask_colors(self._current_pattern_pil)
+
+                # mapping function: returns 1/2/3 or None
+                def pixel_mask_index(px):
+                    if not px or px[3] == 0:
+                        return None
+                    r, g, b, a = px
+                    best_idx = None
+                    best_ds = None
+                    for idx, mcol in enumerate(masks):
+                        if not mcol:
+                            continue
+                        ds = (
+                            (r - mcol[0]) ** 2 + (g - mcol[1]) ** 2 + (b - mcol[2]) ** 2
+                        )
+                        if best_ds is None or ds < best_ds:
+                            best_ds = ds
+                            best_idx = idx + 1
+                    return best_idx
+
+                # apply mask: keep emblem pixel only if pattern mask index in slots
+                try:
+                    em_data = pil.getdata()
+                    pat_data = crop.getdata()
+                    out = []
+                    for ep, pp in zip(em_data, pat_data):
+                        pm = pixel_mask_index(pp)
+                        if pm is not None and pm in slots:
+                            out.append(ep)
+                        else:
+                            # transparent
+                            out.append((0, 0, 0, 0))
+                    new = Image.new("RGBA", pil.size)
+                    new.putdata(out)
+                    pil = new
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # apply rotation around center (PIL rotates counter-clockwise, so negate for clockwise)
+        try:
+            ang = float(getattr(item, "rotation", 0.0) or 0.0)
+            if ang != 0.0:
+                pil = pil.rotate(-ang, resample=Image.BICUBIC, expand=True)
+        except Exception:
+            pass
+
+        # optional debug: dump the resulting emblem PIL to /tmp for inspection
+        try:
+            if os.environ.get("EU5_FLAG_DUMP_EMBLEM"):
+                texname = item.image_path.name.replace(".dds", "")
+                import time
+
+                ts = int(time.time() * 1000)
+                outp = Path(f"/tmp/emblem_debug_{texname}_{ts}.png")
+                try:
+                    pil.save(outp)
+                    print(f"[DumpEmblem] saved {outp}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         return pil2pixmap(pil)
 
     def update_emblem_pixmap(self, item: EmblemItem):
         try:
+            # preserve visual center when pixmap size changes
+            try:
+                old_pix = item.pixmap()
+                old_w = old_pix.width()
+                old_h = old_pix.height()
+            except Exception:
+                old_w = old_h = 0
+            center_x = item.pos().x() + old_w / 2
+            center_y = item.pos().y() + old_h / 2
+
             pix = self.render_emblem_pixmap(item)
             item.setPixmap(pix)
+            # restore top-left so center remains visually in same scene position
+            try:
+                new_w = pix.width()
+                new_h = pix.height()
+                new_x = center_x - new_w / 2
+                new_y = center_y - new_h / 2
+                item.setPos(QPointF(new_x, new_y))
+            except Exception:
+                pass
         except Exception:
             pass
 
